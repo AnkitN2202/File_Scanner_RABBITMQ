@@ -1,0 +1,6 @@
+# config.py
+RABBITMQ_HOST = "localhost"
+RABBITMQ_PORT = 5672
+RABBITMQ_USER = "guest"
+RABBITMQ_PASS = "guest"
+QUEUE_NAME = "file_queue"
