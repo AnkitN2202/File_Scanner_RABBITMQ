@@ -1,15 +1,20 @@
-# scanner.py
-
+#scanner
 import os
 import json
 import time
 import argparse
+import hashlib
+import logging
 from datetime import datetime
 
 import pika
 from tqdm import tqdm
 
 import config
+
+# Setup simple logging
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
 # Helper Functions
@@ -26,9 +31,12 @@ def make_connection(host, port, user, password, retries=5, backoff=2.0):
             return conn
         except Exception as e:
             if attempt >= retries:
+                logger.error("Connection failed after %d attempts: %s", attempt, e)
                 raise
             wait = backoff**attempt
-            print(f"Connection failed (attempt {attempt}). Retrying in {wait:.1f}s...")
+            logger.warning(
+                "Connection failed (attempt %d). Retrying in %.1fs...", attempt, wait
+            )
             time.sleep(wait)
 
 
@@ -51,9 +59,20 @@ def make_message(path):
         }
 
 
+def safe_backup_name(path):
+    """
+    Build a backup filename that reduces collisions.
+    Format: <basename>.<12-char-sha1>.json
+    """
+    abs_path = os.path.abspath(path)
+    h = hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:12]
+    base = os.path.basename(path)
+    return f"{base}.{h}.json"
+
+
 # publish one message with retry logic
 def publish_message(channel, queue_name, payload, retry=3):
-    body = json.dumps(payload).encode("utf-8")
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     props = pika.BasicProperties(
         delivery_mode=2, content_type="application/json"
     )  # persistent
@@ -67,10 +86,12 @@ def publish_message(channel, queue_name, payload, retry=3):
             return True
         except Exception as e:
             if attempt >= retry:
-                print(f"Failed to publish after {attempt} attempts: {e}")
+                logger.error("Failed to publish after %d attempts: %s", attempt, e)
                 return False
             wait = 2**attempt
-            print(f"Publish failed, retrying in {wait}s (attempt {attempt})...")
+            logger.warning(
+                "Publish failed, retrying in %ds (attempt %d)...", wait, attempt
+            )
             time.sleep(wait)
 
 
@@ -85,7 +106,12 @@ def scan_and_publish(
     show_progress=False,
     ext_filter=None,
 ):
-    # connect
+    conn = None
+    pbar = None
+    sent = 0
+
+    # Connect first so we fail fast if RabbitMQ is unreachable
+    logger.info("Connecting to RabbitMQ at %s:%d...", host, port)
     conn = make_connection(host, port, user, password)
     channel = conn.channel()
     channel.queue_declare(queue=queue_name, durable=True)
@@ -94,44 +120,56 @@ def scan_and_publish(
     backup_dir = os.path.join(os.getcwd(), "backup_json")
     os.makedirs(backup_dir, exist_ok=True)
 
-    sent = 0
     pbar = (
         tqdm(total=0, desc="Publishing files", unit="file", dynamic_ncols=True)
         if show_progress
         else None
     )
 
-    # walk directory without storing all files
-    for root, dirs, filenames in os.walk(root_path):
-        for f in filenames:
-            if ext_filter:
-                _, ext = os.path.splitext(f)
-                if ext.lower() not in ext_filter:
-                    continue
-            path = os.path.join(root, f)
-            msg = make_message(path)
+    try:
+        # walk directory without storing all files
+        for root, dirs, filenames in os.walk(root_path):
+            for f in filenames:
+                if ext_filter:
+                    _, ext = os.path.splitext(f)
+                    if ext.lower() not in ext_filter:
+                        continue
+                path = os.path.join(root, f)
+                msg = make_message(path)
 
-            # Save local backup
-            backup_path = os.path.join(backup_dir, f"{os.path.basename(path)}.json")
-            with open(backup_path, "w") as bf:
-                json.dump(msg, bf, indent=2)
+                # Save local backup with unique safe name
+                backup_file = safe_backup_name(path)
+                backup_path = os.path.join(backup_dir, backup_file)
+                try:
+                    with open(backup_path, "w", encoding="utf-8") as bf:
+                        json.dump(msg, bf, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    logger.warning("Failed to write backup for %s: %s", path, e)
 
-            # Publish to RabbitMQ
-            ok = publish_message(channel, queue_name, msg)
-            if not ok:
-                print("Warning: message failed for", path)
-            else:
-                sent += 1
+                # Publish to RabbitMQ
+                ok = publish_message(channel, queue_name, msg)
+                if not ok:
+                    logger.warning("Warning: message failed for %s", path)
+                else:
+                    sent += 1
 
-            if pbar:
-                pbar.update(1)
+                if pbar:
+                    pbar.update(1)
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user.")
+    finally:
+        if pbar:
+            pbar.close()
+        try:
+            if conn and not conn.is_closed:
+                conn.close()
+        except Exception:
+            pass
 
-    if pbar:
-        pbar.close()
-
-    conn.close()
-    print(
-        f"Done. Published {sent} messages to queue '{queue_name}' and saved backup locally."
+    logger.info(
+        "Done. Published %d messages to queue '%s' and saved backup locally.",
+        sent,
+        queue_name,
     )
 
 
@@ -139,7 +177,8 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) == 1:
-        sys.argv += ["/Users/ankitsandeepnanaware/Documents"]  # default folder to scan
+        # keep your default, replace with your local default if needed
+        sys.argv += ["/Users/ankitsandeepnanaware/Documents"]
 
     ap = argparse.ArgumentParser(
         description="Simple scanner -> RabbitMQ + local backup"
