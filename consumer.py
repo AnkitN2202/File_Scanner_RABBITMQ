@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 consumer.py
@@ -6,7 +7,11 @@ Simple consumer that prints messages and acknowledges them.
 
 import pika
 import json
+import logging
 import config
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def consume_messages(queue_name):
@@ -21,22 +26,40 @@ def consume_messages(queue_name):
     channel = conn.channel()
     channel.queue_declare(queue=queue_name, durable=True)
 
+    # Do not give more than one unacknowledged message to a worker
+    try:
+        channel.basic_qos(prefetch_count=1)
+    except Exception:
+        # Not critical if qos cannot be set on older clients
+        pass
+
     def callback(ch, method, properties, body):
-        msg = json.loads(body)
+        try:
+            msg = json.loads(body)
+        except Exception:
+            logger.warning("Received non-json message or decode error.")
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+            return
+
         print("Received:", msg, flush=True)
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
     channel.basic_consume(queue=queue_name, on_message_callback=callback)
-    print(
-        f"Listening to queue '{queue_name}' on {config.RABBITMQ_HOST}:{config.RABBITMQ_PORT}. Press Ctrl+C to exit.",
-        flush=True,
+    logger.info(
+        "Listening to queue '%s' on %s:%d. Press Ctrl+C to exit.",
+        queue_name,
+        config.RABBITMQ_HOST,
+        config.RABBITMQ_PORT,
     )
 
     try:
         channel.start_consuming()
     except KeyboardInterrupt:
-        print("Exiting...", flush=True)
-        conn.close()
+        logger.info("Exiting...")
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
